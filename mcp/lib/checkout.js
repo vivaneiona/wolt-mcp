@@ -52,6 +52,10 @@ export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, cou
   if (!pageRes.ok) throw new Error(`baskets fetch failed: HTTP ${pageRes.status}`);
   const basket = venueId ? findBasketForVenue(pageRes.json, venueId) : (pageRes.json?.baskets || [])[0];
   if (!basket) throw new Error(venueId ? `no basket found for venue ${venueId}` : "no baskets found — add items first");
+  // shortcut: the weighted checkout schema is unverified; never quote a total that omits purchased grams.
+  if ((basket.items || []).some((line) => line.weighted_item_info || line.is_weighted_item)) {
+    throw new Error("Checkout preview cannot reliably price weighted items yet. Review the weight and final total on wolt.com; no total was calculated here.");
+  }
 
   const venue = basket.venue || {};
   const resolvedVenueId = venue.id || venueId;

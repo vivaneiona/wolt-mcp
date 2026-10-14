@@ -10,13 +10,15 @@
 // via login_via_chrome (or set_wolt_token); it auto-renews after that.
 // See docs/architecture.md for how the API layer works.
 import { createRequire } from "node:module";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
 import {
   searchItems, selectBestVenue, rankVenues, buildBasketBody, reconcileWeightedItems, resolveCurrency, BASKET_URL,
-  BASKETS_PAGE_URL, BASKETS_DELETE_URL, isVenueObjectId, findBasketForVenue, mergeBasketItems
+  BASKETS_PAGE_URL, BASKETS_DELETE_URL, isVenueObjectId, findBasketForVenue, mergeBasketItems, basketItemKey, upsertItemFromLine
 } from "./lib/wolt.js";
 import { woltFetch } from "./lib/http.js";
 import { rankCandidates } from "./lib/match.js";
@@ -28,7 +30,7 @@ import { cdpLogin } from "./lib/cdp-login.js";
 import { getVenue, getMenu, getItemOptions, getCategories, resolveItem, parseItemUrl, searchVenueItems, getCatalogLanguage, getMarketLanguage, getWeightConfigs } from "./lib/venue.js";
 import { getOrderHistory, getOrder, geocodeAddress } from "./lib/account.js";
 import { langOf, sameScript, isNonLatinLang } from "./lib/lang.js";
-import { planAtVenue, planResponse, translationPreflight, rankPlans, mapPool } from "./lib/plan.js";
+import { planAtVenue, planResponse, translationPreflight, rankPlans, mapPool, quantityForItem } from "./lib/plan.js";
 
 // catalogLanguage (+ a hint for non-Latin markets) for tool responses that
 // establish or report the user's location — so the model knows to translate
@@ -58,16 +60,75 @@ async function needLocation(lat, lon) {
 async function getBasketsPage(lat, lon) {
   const r = await woltFetch(`${BASKETS_PAGE_URL}?lat=${lat}&lon=${lon}`);
   if (!r.ok) throw new Error(`baskets fetch failed: HTTP ${r.status} ${r.text.slice(0, 200)}`);
+  if (!Array.isArray(r.json?.baskets) || r.json.baskets.some((b) => !b?.venue?.id || !Array.isArray(b.items))) {
+    throw new Error("Invalid baskets response — cannot safely read or replace the current basket.");
+  }
   return r.json;
 }
 
-// `npx -y wolt-mcp install` — one-liner setup: registers this server in Claude
+// Serialize this process's read/replace operations so parallel tools cannot lose lines.
+const basketWrites = new Map();
+async function withBasketLock(venueId, write) {
+  const task = (basketWrites.get(venueId) || Promise.resolve()).catch(() => {}).then(write);
+  basketWrites.set(venueId, task);
+  try { return await task; }
+  finally { if (basketWrites.get(venueId) === task) basketWrites.delete(venueId); }
+}
+
+async function verifyBasketWrite(venueId, expected, loc) {
+  const retryNote = "The write was accepted. Inspect get_baskets or wolt.com before retrying: another add would increase quantities.";
+  try {
+    const after = findBasketForVenue(await getBasketsPage(loc.lat, loc.lon), venueId);
+    const actual = after?.items || [];
+    const remaining = [...actual];
+    const mismatchedLines = [];
+    const droppedLines = [];
+    for (const wanted of expected) {
+      const index = remaining.findIndex((line) => basketItemKey(line) === basketItemKey(wanted));
+      if (index < 0) { droppedLines.push(wanted.name || wanted.id); continue; }
+      const [line] = remaining.splice(index, 1);
+      if (line.count !== wanted.count
+        || (line.weighted_item_info?.purchased_weight_in_grams ?? null) !== (wanted.weighted_item_info?.purchased_weight_in_grams ?? null)
+        || (line.weighted_item_info?.count ?? null) !== (wanted.weighted_item_info?.count ?? null)
+        || !!line.substitution_settings?.is_allowed !== !!wanted.substitution_settings?.is_allowed) {
+        mismatchedLines.push(wanted.name || wanted.id);
+      }
+    }
+    const verified = !droppedLines.length && !mismatchedLines.length && !remaining.length;
+    return {
+      ok: verified, verified, writeSucceeded: true, linesInBasket: actual.length,
+      ...(droppedLines.length ? { droppedLines } : {}),
+      ...(mismatchedLines.length ? { mismatchedLines } : {}),
+      ...(remaining.length ? { unexpectedLines: remaining.map((line) => line.name || line.id) } : {}),
+      ...(!verified ? { verificationError: "Basket contents differ from the requested items, quantities, weights, options or substitutions.", retryNote } : {})
+    };
+  } catch (e) {
+    return { ok: false, verified: false, writeSucceeded: true, verificationError: e.message, retryNote };
+  }
+}
+
+async function mutateBasket(url, body) {
+  try {
+    const response = await woltFetch(url, { method: "POST", body });
+    if (response.ok) return { response };
+    if (response.status < 500) return { error: errText(`Basket mutation rejected: HTTP ${response.status} ${response.text.slice(0, 200)}`) };
+    throw new Error(`HTTP ${response.status}`);
+  } catch (e) {
+    // A timeout or server error can arrive after Wolt committed the replacement.
+    return { error: { ...text({
+      ok: false, verified: false, writeSucceeded: null, writeError: e.message,
+      retryNote: "The write outcome is unknown. Inspect get_baskets or wolt.com before retrying; another add could duplicate quantities."
+    }), isError: true } };
+  }
+}
+
+// `node server.mjs install` registers this checkout in Claude
 // Desktop's config (and prints the JSON for any other MCP client), then exits.
 if (process.argv[2] === "install") {
   const { readFileSync, writeFileSync, mkdirSync, existsSync } = await import("node:fs");
   const { homedir } = await import("node:os");
   const { join } = await import("node:path");
-  const entry = { command: "npx", args: ["-y", "wolt-mcp"] };
+  const entry = { command: process.execPath, args: [fileURLToPath(import.meta.url)] };
   const cfgPath = process.platform === "darwin"
     ? join(homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json")
     : process.platform === "win32"
@@ -135,7 +196,7 @@ const errText = (msg) => ({ content: [{ type: "text", text: msg }], isError: tru
 // Version comes from package.json so a release bump can't leave the server
 // reporting a stale one (test/version.test.mjs keeps manifest.json in step).
 const { version: VERSION } = createRequire(import.meta.url)("./package.json");
-const server = new McpServer({ name: "wolt-mcp", version: VERSION }, {
+export const server = new McpServer({ name: "wolt-mcp", version: VERSION }, {
   instructions: "When the user wants to BUY something (not just browse), call wolt_status FIRST — it live-verifies the Wolt login. If it reports loginNeeded, sort the login out with the user (login_via_chrome, or set_wolt_token on Firefox/Safari) before searching and planning, so the work isn't lost to an expired session mid-checkout. Searching and browsing venues never need a login. For the delivery address: use_saved_address pulls the user's saved Wolt addresses and sets one as the search location (get_wolt_profile does NOT have addresses); a spoken address goes through resolve_address + set_location. Baskets are single-venue: source every item from one store. The fast path for a shopping list is wolt_status -> use_saved_address (if no location) -> ONE plan_cart call (it auto-picks the store and reports runner-up coverage) -> review the matches -> add_to_cart -> checkout_preview. wolt_status and the address tools report the market's catalogLanguage — translate the ingredient list into it BEFORE calling plan_cart (Greek in Greece, Japanese in Japan, Hebrew in Israel, Georgian in Georgia, and so on), and write each product in dictionary form (singular nominative, like a shelf label) since catalog search matches prefixes and inflected words find little or nothing; plan_cart refuses off-language lists with needsTranslation. Don't compare stores manually with repeated searches unless the user asks, and never write a lowCoverage plan without agreeing with the user first."
 });
 
@@ -219,7 +280,7 @@ server.tool(
 // --- use_saved_address: pull the delivery address from the Wolt account ---
 server.tool(
   "use_saved_address",
-  "Fetch the user's saved Wolt delivery addresses (needs a token) and set one as the default search location. With no address_id: lists all addresses and auto-saves the one Wolt marks selected (or the only one). Call this right after connecting the account so searches use the user's real address instead of the default.",
+  "Fetch saved Wolt addresses and set the search/estimate location only. This does NOT change the delivery address selected at checkout on wolt.com. With multiple addresses, pass address_id explicitly; without it the tool lists choices. A single saved address is selected automatically.",
   { address_id: z.string().optional().describe("Address id from a previous call, to pick a specific one") },
   async ({ address_id }) => {
     try {
@@ -241,14 +302,14 @@ server.tool(
         };
       }).filter((a) => a.lat != null && a.lon != null);
       if (!addresses.length) return errText("No saved addresses with coordinates on this Wolt account. Ask the user for their address and use set_location.");
-      // No "selected" flag in the payload — prefer the home-labeled address.
+      // The payload has no reliable indication of the address selected on the website.
       const pick = address_id
         ? addresses.find((a) => a.id === address_id)
-        : addresses.length === 1 ? addresses[0]
-        : addresses.find((a) => a.labelType === "home") || null;
-      if (!pick) return text({ addresses, note: "Multiple addresses and none labeled home — ask the user which to use, then call again with address_id." });
+        : addresses.length === 1 ? addresses[0] : null;
+      if (address_id && !pick) return errText(`Saved address ${address_id} was not found; nothing changed.`);
+      if (!pick) return text({ addresses, checkoutAddressUnchanged: true, note: "Choose the requested address and call again with address_id. The checkout address on wolt.com is unchanged." });
       const saved = setLocation({ lat: pick.lat, lon: pick.lon, label: pick.alias ? `${pick.alias} — ${pick.address}` : pick.address });
-      return text({ saved, pickedAddressId: pick.id, addresses, ...(await marketLanguageFields(pick.lat, pick.lon)) });
+      return text({ saved, pickedAddressId: pick.id, addresses, checkoutAddressUnchanged: true, note: "Search location saved. Confirm the delivery address separately at checkout on wolt.com.", ...(await marketLanguageFields(pick.lat, pick.lon)) });
     } catch (e) {
       return errText(e.message);
     }
@@ -258,7 +319,7 @@ server.tool(
 // --- plan_cart: whole list -> single-store plan, one call ---
 server.tool(
   "plan_cart",
-  "Resolve a whole ingredient list into a single-store cart in ONE call. Without venue_slug it auto-picks: shortlists the best-covering nearby stores and races the list against each store's own catalog, returning the winner plus per-store coverage of the runners-up (evaluatedVenues) — if lowCoverage is flagged, agree with the user before writing anything. With venue_slug it plans against that store only. Write ingredient lines in the market's catalog language (reported by wolt_status/set_location/use_saved_address as catalogLanguage — translate them yourself), and name each product in DICTIONARY form — singular nominative, the way a shelf label reads — because catalog search matches prefixes: an inflected line like '2 sipulia' finds a fraction of what '2 sipuli' finds, and in the worst case nothing. If most lines are in the wrong script it returns needsTranslation instead of planning — translate and call again. A rateLimited response means Wolt throttled the burst: wait ~30s and retry, don't rephrase. Returns line items with alternatives + a ready add_to_cart basket. Each line carries a confidence: 'low' ones are listed again under verifyBeforeWriting with the reason — read those names yourself and judge by meaning (a sauce, pesto, snack or flavoured version scores just as well as the real product), swapping in an alternative or dropping the line before you write anything.",
+  "Resolve a whole ingredient list into a single-store cart in ONE call. Without venue_slug it auto-picks: shortlists the best-covering nearby stores and races the list against each store's own catalog, returning the winner plus per-store coverage of the runners-up (evaluatedVenues) — if lowCoverage is flagged, agree with the user before writing anything. With venue_slug it plans against that store only. Write ingredient lines in the market's catalog language (reported by wolt_status/set_location/use_saved_address as catalogLanguage — translate them yourself), and name each product in DICTIONARY form — singular nominative, the way a shelf label reads — because catalog search matches prefixes: an inflected line like '2 sipulia' finds a fraction of what '2 sipuli' finds, and in the worst case nothing. If most lines are in the wrong script it returns needsTranslation instead of planning — translate and call again. A rateLimited response means Wolt throttled the burst: wait ~30s and retry, don't rephrase. Returns line items with alternatives and quantities. If quantityReview is present, resolve package counts or grams before writing; no ready basket is returned. Each line carries a confidence: 'low' ones are listed again under verifyBeforeWriting with the reason — read those names yourself and judge by meaning (a sauce, pesto, snack or flavoured version scores just as well as the real product), swapping in an alternative or dropping the line before you write anything.",
   {
     ingredients: z.array(z.string()).describe("Ingredient lines, e.g. ['800 g crushed tomatoes', '1 onion'] — in the store's catalogLanguage (translate them yourself; the plan response reports it), and each product named in DICTIONARY form: singular nominative, as a shop shelf labels it, not as a recipe inflects it ('2 sipuli' not '2 sipulia', '400 g tomaattimurska' not 'tomaattimurskaa')"),
     venue_slug: z.string().optional().describe("Pin planning to this store instead of auto-picking"),
@@ -309,13 +370,17 @@ server.tool(
       const { venue, chosen, missing } = selectBestVenue(perIngredient);
       if (!venue) return text({ venue: null, missing, note: "No store covered these ingredients." });
       const currency = resolveCurrency({ candidates: chosen.map((c) => c.candidate), country: venue.country });
+      const selections = chosen.map((c) => ({ candidate: c.candidate, ...quantityForItem(c.ingredient, c.candidate) }));
+      const lineItems = chosen.map((c) => ({ ingredient: c.ingredient, name: c.candidate.name, itemId: c.candidate.itemId, price: c.candidate.price, isWeighted: c.candidate.isWeighted, ...quantityForItem(c.ingredient, c.candidate) }));
+      const quantityReview = lineItems.filter((li) => li.quantityNeedsReview);
       return text({
         venue,
         coverage: `${chosen.length}/${ingredients.length}`,
-        lineItems: chosen.map((c) => ({ ingredient: c.ingredient, name: c.candidate.name, itemId: c.candidate.itemId, price: c.candidate.price, isWeighted: c.candidate.isWeighted })),
+        lineItems,
         missing,
-        basket: currency ? buildBasketBody(chosen.map((c) => ({ candidate: c.candidate, count: 1 })), venue.venueId, currency) : null,
-        ...(currency ? {} : { basketNote: "No currency on record for this venue — call add_to_cart with an explicit currency taken from search_products results." })
+        basket: currency && !quantityReview.length ? buildBasketBody(selections, venue.venueId, currency) : null,
+        ...(quantityReview.length ? { quantityReview, basketNote: "Confirm package counts or grams for these lines before add_to_cart; no basket was built." }
+          : currency ? {} : { basketNote: "No currency on record for this venue — call add_to_cart with an explicit currency taken from search_products results." })
       });
     } catch (e) {
       return errText(`plan failed: ${e.message}`);
@@ -326,7 +391,7 @@ server.tool(
 // --- add_to_cart: write the basket (needs WOLT_BEARER_TOKEN) ---
 server.tool(
   "add_to_cart",
-  "Write items to the user's Wolt basket for one venue. All items must share the venue_id. Needs login (if wolt_status says loginNeeded, do that first). ALWAYS pass venue_slug: it lets each line's weighted flag be reconciled against how the catalog actually sells the item — items named '~900 g pack' are often COUNT items, truly weighted items only accept multiples of their gramsPerStep, and either mismatch is silently dropped by Wolt. Corrections made are reported as `adjustments`. The response also re-reads the basket and reports droppedLines for anything Wolt still discarded — treat those as NOT added. Returns a checkoutUrl — give it to the user, and call checkout_preview for the real total including fees. Nothing is ever ordered automatically; the user reviews and pays on wolt.com.",
+  "Write items to the user's Wolt basket for one venue. All items must share the venue_id. Needs login (if wolt_status says loginNeeded, do that first). ALWAYS pass venue_slug: it lets each line's weighted flag be reconciled against how the catalog actually sells the item — items named '~900 g pack' are often COUNT items, truly weighted items only accept multiples of their gramsPerStep, and either mismatch is silently dropped by Wolt. Corrections made are reported as `adjustments`. A saved search location and a readable existing basket are required. New items disallow store substitutions unless allow_substitution is true. After writing, the entire basket is verified, including counts, grams and options. If verified is false or the write outcome is unknown, inspect get_baskets or wolt.com before retrying; repeated adds increase quantities. Returns a checkoutUrl — give it to the user, and call checkout_preview for an estimate including fees when there are no weighted items. Nothing is ever ordered automatically; the user reviews and pays on wolt.com.",
   {
     venue_id: z.string(),
     venue_slug: z.string().optional().describe("Venue slug — in search_products results it is venues[venueId].slug, not a field on the item"),
@@ -336,10 +401,11 @@ server.tool(
     items: z.array(z.object({
       id: z.string(),
       name: z.string(),
-      price: z.number().describe("price in minor units"),
-      count: z.number().int().default(1),
+      price: z.number().int().nonnegative().describe("price in minor units"),
+      count: z.number().int().positive().default(1),
       weighted: z.boolean().default(false),
-      grams: z.number().nullable().default(null).describe("grams to buy for by-weight items"),
+      grams: z.number().positive().nullable().default(null).describe("Total grams to buy for by-weight items"),
+      allow_substitution: z.boolean().default(false).describe("Allow the store to replace this product; defaults to false"),
       options: z.array(z.object({
         id: z.string().describe("groupId from get_dish_options"),
         values: z.array(z.object({
@@ -348,15 +414,18 @@ server.tool(
           price: z.number().default(0)
         }))
       })).optional().describe("Dish option selections; required-option dishes need these")
-    }))
+    })).min(1)
   },
-  async ({ venue_id, venue_slug, city_slug, country, currency, items }) => {
+  async ({ venue_id, venue_slug, city_slug, country, currency, items }) => withBasketLock(venue_id, async () => {
     // A slug posted as venue_id yields a success-shaped response but a basket
     // that never persists (phantom basket). Refuse early rather than lie.
     if (!isVenueObjectId(venue_id)) {
       return errText(`venue_id "${venue_id}" is not a Wolt venue id (24 hex chars). Use the venueId field from search_products — not the venue slug — or the item was NOT added.`);
     }
     try {
+      const loc = getLocation();
+      if (!loc) return errText("Set a search location with use_saved_address or set_location before changing a basket; nothing was written.");
+      const existing = findBasketForVenue(await getBasketsPage(loc.lat, loc.lon), venue_id);
       // Resolve currency/country from the venue when not supplied, then from
       // the venue's market — never from a hardcoded default, which would price
       // one market's basket in another's money.
@@ -378,42 +447,19 @@ server.tool(
         ? reconcileWeightedItems(items, await getWeightConfigs(venue_slug, items.map((it) => it.id)))
         : [];
       let body = buildBasketBody(
-        items.map((it) => ({ candidate: { itemId: it.id, name: it.name, price: it.price, isWeighted: it.weighted }, count: it.count, grams: it.grams || undefined, options: it.options })),
+        items.map((it) => ({ candidate: { itemId: it.id, name: it.name, price: it.price, isWeighted: it.weighted }, count: it.count, grams: it.grams || undefined, options: it.options, allowSubstitution: it.allow_substitution })),
         venue_id, currency
       );
       // POST /baskets replaces the venue's basket wholesale — merge with any
       // existing lines first so we never clobber what the user already added.
-      let mergedFromExisting = 0;
-      try {
-        const loc = getLocation();
-        const existing = loc ? findBasketForVenue(await getBasketsPage(loc.lat, loc.lon), venue_id) : null;
-        if (existing?.items?.length) {
-          body = { ...body, items: mergeBasketItems(existing.items, body.items) };
-          mergedFromExisting = existing.items.length;
-        }
-      } catch (e) { /* best effort — a fresh basket write is still correct */ }
-      const r = await woltFetch(BASKET_URL, { method: "POST", body });
-      if (!r.ok) return errText(`cart write failed: HTTP ${r.status} ${r.text.slice(0, 300)}`);
+      body = { ...body, items: mergeBasketItems(existing?.items || [], body.items) };
+      const mergedFromExisting = existing?.items.length || 0;
+      const { response: r, error } = await mutateBasket(BASKET_URL, body);
+      if (error) return error;
       // Read-after-write: Wolt's basket POST returns success even for lines it
       // silently discards (invalid weight, unavailable item). Re-read the
       // basket and diff, so "ok" is never claimed for a line that isn't there.
-      let verification = {};
-      try {
-        const loc = getLocation();
-        if (loc) {
-          const after = findBasketForVenue(await getBasketsPage(loc.lat, loc.lon), venue_id);
-          const present = new Set((after?.items || []).map((i) => i.id));
-          const dropped = items.filter((it) => !present.has(it.id)).map((it) => it.name);
-          verification = {
-            verified: true,
-            linesInBasket: (after?.items || []).length,
-            ...(dropped.length ? {
-              droppedLines: dropped,
-              droppedNote: "Wolt accepted the write but silently DROPPED these lines — usually an invalid weight (must be a multiple of the item's gramsPerStep) or an unavailable item. They are NOT in the cart: fix and re-add them, and don't tell the user they're included."
-            } : {})
-          };
-        }
-      } catch (e) { /* verification is best-effort; the write itself succeeded */ }
+      const verification = await verifyBasketWrite(venue_id, body.items, loc);
       let checkoutUrl = "https://wolt.com";
       if (venue_slug && country && city_slug) {
         checkoutUrl = `https://wolt.com/en/${country}/${city_slug}/venue/${venue_slug}`;
@@ -423,23 +469,23 @@ server.tool(
         try { checkoutUrl = (await getVenue(venue_slug)).shareUrl || checkoutUrl; } catch (e) {}
         if (checkoutUrl === "https://wolt.com") checkoutUrl = `https://wolt.com/search?q=${encodeURIComponent(venue_slug)}`;
       }
-      return text({
-        ok: true, status: r.status, basketId: r.json?.id ?? null, itemsWritten: items.length, existingLinesPreserved: mergedFromExisting,
+      return { ...text({
+        status: r.status, basketId: r.json?.id ?? null, itemsWritten: items.length, existingLinesPreserved: mergedFromExisting,
         ...(adjustments.length ? { adjustments } : {}),
         ...verification,
         checkoutUrl,
-        note: `Basket written. Give the user this link to review and check out: ${checkoutUrl}. Then call checkout_preview for the delivery-included total.`
-      });
+        note: verification.ok ? `Basket verified. Review and check out at ${checkoutUrl}; checkout_preview estimates delivery and fees.` : verification.retryNote
+      }), isError: !verification.ok };
     } catch (e) {
       return errText(e.message);
     }
-  }
+  })
 );
 
 // --- get_baskets: list the user's current Wolt baskets ---
 server.tool(
   "get_baskets",
-  "List the user's current Wolt baskets (needs a token): basket id, venue, and line items with names, counts, and prices (minor units). Use before add_to_cart to see what's already there, or after to confirm the write persisted.",
+  "List the user's current Wolt baskets (needs a token): basket id, venue, and line items with names, counts, prices (minor units), grams, options and replacement permissions. Use before add_to_cart to see what's already there, or after to confirm the write persisted.",
   {
     lat: z.number().optional().describe("Override latitude; defaults to the saved location"),
     lon: z.number().optional().describe("Override longitude; defaults to the saved location")
@@ -452,7 +498,12 @@ server.tool(
         basketId: b.id,
         venueId: b.venue?.id,
         venueName: b.venue?.name,
-        items: (b.items || []).map((it) => ({ id: it.id, name: it.name, count: it.count, price: it.price }))
+        items: (b.items || []).map((it) => ({
+          id: it.id, name: it.name, count: it.count, price: it.price,
+          weighted: !!it.weighted_item_info,
+          grams: it.weighted_item_info?.purchased_weight_in_grams ?? null,
+          options: it.options || [], allow_substitution: !!it.substitution_settings?.is_allowed
+        }))
       }));
       return text({ count: baskets.length, baskets });
     } catch (e) {
@@ -468,8 +519,8 @@ server.tool(
   { basket_id: z.string().describe("Basket id from get_baskets") },
   async ({ basket_id }) => {
     try {
-      const r = await woltFetch(BASKETS_DELETE_URL, { method: "POST", body: { ids: [basket_id] } });
-      if (!r.ok) return errText(`basket delete failed: HTTP ${r.status} ${r.text.slice(0, 200)}`);
+      const { error } = await mutateBasket(BASKETS_DELETE_URL, { ids: [basket_id] });
+      if (error) return error;
       return text({ ok: true, deleted: basket_id });
     } catch (e) {
       return errText(e.message);
@@ -756,7 +807,7 @@ server.tool(
 // --- checkout_preview: price the basket (fees, delivery) — never orders ---
 server.tool(
   "checkout_preview",
-  "Preview the checkout for the user's current basket at one venue: total payable amount including delivery fees and service charges, delivery options, and active offers. Read-only — never places an order. Use after add_to_cart to tell the user their real total before they open wolt.com.",
+  "Estimate checkout for a basket of packaged items, including delivery fees, service charges and offers. Weighted baskets are refused because their checkout pricing schema is not verified. Read-only; never places an order or changes the delivery address. Confirm the final amount, credits and address on wolt.com.",
   {
     venue_id: z.string().optional().describe("Venue id (24 hex) of the basket to price; defaults to the user's only/first basket"),
     venue_slug: z.string().optional().describe("venueSlug from search results — improves category resolution"),
@@ -772,7 +823,7 @@ server.tool(
         lat, lon, tip, promoCode: promo_code || null
       });
       const { raw, ...summary } = preview; // keep the tool result compact
-      return text(summary);
+      return text({ ...summary, estimateOnly: true, note: "Confirm the delivery address, weighted amounts, credits and final total on wolt.com before payment." });
     } catch (e) {
       return errText(e.message);
     }
@@ -782,45 +833,66 @@ server.tool(
 // --- update_cart_item: change a line's count or remove it ---
 server.tool(
   "update_cart_item",
-  "Set the count of one item in the user's basket at a venue, or remove it (count 0). Uses read-merge-write like add_to_cart. If removing the LAST line, the whole basket is deleted instead (Wolt has no empty-basket state).",
+  "Update a basket item's count, total grams or replacement permission; count 0 removes it. Weighted quantity changes require explicit grams and venue_slug to validate the catalog step. Reads the current basket before writing and verifies the result. Removing the last line deletes the basket.",
   {
     venue_id: z.string().describe("Venue id (24 hex) from get_baskets"),
     item_id: z.string().describe("Item id of the line to change"),
-    count: z.number().int().min(0).describe("New count; 0 removes the line")
+    venue_slug: z.string().optional().describe("Required for weight changes, to validate the catalog step"),
+    count: z.number().int().min(0).optional().describe("New count; 0 removes the line"),
+    grams: z.number().positive().optional().describe("New total purchased weight in grams"),
+    allow_substitution: z.boolean().optional().describe("Whether the store may replace this item")
   },
-  async ({ venue_id, item_id, count }) => {
+  async ({ venue_id, item_id, venue_slug, count, grams, allow_substitution }) => withBasketLock(venue_id, async () => {
     if (!isVenueObjectId(venue_id)) return errText(`venue_id "${venue_id}" is not a Wolt venue id (24 hex chars).`);
+    if (count == null && grams == null && allow_substitution == null) return errText("Provide count, grams or allow_substitution; nothing was changed.");
     try {
-      const loc = await needLocation();
+      const loc = getLocation();
+      if (!loc) return errText("Set a search location before changing a basket; nothing was written.");
       const page = await getBasketsPage(loc.lat, loc.lon);
       const basket = findBasketForVenue(page, venue_id);
       if (!basket) return errText(`no basket found for venue ${venue_id}`);
-      const line = (basket.items || []).find((it) => it.id === item_id);
+      const matches = basket.items.filter((it) => it.id === item_id);
+      if (matches.length > 1) return errText("Multiple variants share this item id; edit the intended variant on wolt.com to avoid changing the wrong line.");
+      const [line] = matches;
       if (!line) return errText(`item ${item_id} not in this basket. Lines: ${(basket.items || []).map((i) => `${i.id} (${i.name})`).join(", ")}`);
-
+      if (count !== 0 && line.weighted_item_info && count != null && count !== line.count && grams == null) {
+        return errText("Changing a weighted item's count requires its new total grams and venue_slug; nothing was changed.");
+      }
+      const updated = upsertItemFromLine(line, count);
+      const adjustments = [];
+      if (count !== 0 && grams != null) {
+        if (!line.weighted_item_info || !venue_slug) return errText("Only weighted items accept grams; provide venue_slug to validate the weight. Nothing was changed.");
+        const configs = await getWeightConfigs(venue_slug, [item_id]);
+        if (!configs?.get(item_id)?.gramsPerStep) return errText("Cannot verify this item's weight step in the catalog; nothing was changed.");
+        const request = { id: item_id, weighted: true, grams };
+        adjustments.push(...reconcileWeightedItems([request], configs));
+        updated.weighted_item_info.purchased_weight_in_grams = request.grams;
+      }
+      if (allow_substitution != null) updated.substitution_settings.is_allowed = allow_substitution;
       const remaining = (basket.items || []).filter((it) => it.id !== item_id);
       if (count === 0 && remaining.length === 0) {
         // last line → delete the basket
-        const r = await woltFetch(BASKETS_DELETE_URL, { method: "POST", body: { ids: [basket.id] } });
-        if (!r.ok) return errText(`basket delete failed: HTTP ${r.status} ${r.text.slice(0, 200)}`);
-        return text({ ok: true, removedItem: item_id, basketDeleted: basket.id });
+        const { error } = await mutateBasket(BASKETS_DELETE_URL, { ids: [basket.id] });
+        if (error) return error;
+        const verification = await verifyBasketWrite(venue_id, [], loc);
+        return { ...text({ ...verification, removedItem: item_id, basketDeleted: basket.id }), isError: !verification.ok };
       }
       const items = mergeBasketItems(count === 0 ? remaining : basket.items, [])
-        .map((it) => (it.id === item_id ? { ...it, count } : it))
-        .filter((it) => it.count > 0);
+        .map((it) => (it.id === item_id ? updated : it));
       // The basket's own currency is authoritative here; the venue's market is
       // the fallback. Rewriting a basket in a guessed currency is worse than
       // failing loudly.
       const currency = resolveCurrency({ currency: basket.currency, country: basket.venue?.country });
       if (!currency) return errText(`basket ${basket.id} has no currency on record and the venue's market is unknown — nothing was changed. Re-add the line with add_to_cart (passing currency) instead.`);
       const body = { items, venue_id, currency };
-      const r = await woltFetch(BASKET_URL, { method: "POST", body });
-      if (!r.ok) return errText(`cart update failed: HTTP ${r.status} ${r.text.slice(0, 300)}`);
-      return text({ ok: true, itemId: item_id, newCount: count, linesNow: items.length, note: count === 0 ? "Line removed. Verify with get_baskets — if the line reappears, Wolt may not support removing single lines from multi-line baskets server-side." : "Count updated." });
+      const { error } = await mutateBasket(BASKET_URL, body);
+      if (error) return error;
+      const verification = await verifyBasketWrite(venue_id, items, loc);
+      return { ...text({ ...verification, itemId: item_id, newCount: count ?? line.count, grams: updated.weighted_item_info?.purchased_weight_in_grams ?? null, adjustments, linesNow: items.length }), isError: !verification.ok };
     } catch (e) {
       return errText(e.message);
     }
-  }
+  })
 );
 
 // --- login_via_chrome: zero-paste login by watching a Chrome you launch ---
@@ -841,11 +913,11 @@ server.tool(
 // --- set_wolt_token: paste tokens in-chat; enables auto-refresh ---
 server.tool(
   "set_wolt_token",
-  "Store the user's Wolt tokens (persisted locally, chmod 600). Prefer login_via_chrome; use this when the user pastes a token themselves. Accepts access_token and/or refresh_token, or a JSON blob containing either. With a refresh token stored, the server auto-refreshes forever — the user pastes once.",
+  "Store the user's Wolt tokens (persisted locally, chmod 600). Prefer login_via_chrome; use this when the user pastes a token themselves. Accepts access_token and/or refresh_token, or a JSON blob containing either. With a valid refresh token stored, the server renews access automatically; reconnect if Wolt revokes the session.",
   {
     blob: z.string().optional().describe("A JSON blob containing the tokens, e.g. {\"refresh_token\":\"...\"}"),
     access_token: z.string().optional().describe("Wolt access JWT (eyJ..., 'Bearer ' prefix ok)"),
-    refresh_token: z.string().optional().describe("Wolt refresh token — enables permanent auto-refresh")
+    refresh_token: z.string().optional().describe("Wolt refresh token — enables automatic renewal while the token remains valid")
   },
   async ({ blob, access_token, refresh_token }) => {
     if (blob) {
@@ -890,16 +962,29 @@ server.tool(
 // --- wolt_status: live login check + location ---
 server.tool(
   "wolt_status",
-  "Call this FIRST whenever the user wants to buy or manage their account: it live-verifies the Wolt login (refreshing the access token if needed) and reports the configured location plus the market's catalogLanguage — write product queries and plan_cart ingredient lines in that language (translate them yourself). If loginNeeded is true, offer login_via_chrome (or set_wolt_token) before planning a cart. Search works without a token.",
+  "Call this FIRST whenever the user wants to buy or manage their account: it live-verifies the Wolt login (refreshing the access token if needed) and reports the configured location plus the market's catalogLanguage — write product queries and plan_cart ingredient lines in that language (translate them yourself). If loginNeeded is true, offer login_via_chrome (or set_wolt_token) before planning a cart. If loginNeeded is null, verification was unavailable; retry later rather than asking for a new login. Search works without a token.",
   async () => {
     // Actually exercise the token chain instead of reporting what's on disk —
     // a stored refresh token can be stale, and finding that out here beats
     // finding out after the cart is planned.
-    let loginNeeded = false, loginDetail = null;
-    try { await getAccessToken(); } catch (e) { loginNeeded = true; loginDetail = e.message; }
+    let loginNeeded = null, loginVerified = false, loginDetail = null;
+    try {
+      await getAccessToken();
+      loginNeeded = null; // A network/server error cannot establish whether login is needed.
+      const r = await woltFetch("https://restaurant-api.wolt.com/v1/user/me");
+      if (r.ok) { loginNeeded = false; loginVerified = true; }
+      else {
+        loginNeeded = r.status === 401 || r.status === 403 ? true : null;
+        loginDetail = `Profile verification failed: HTTP ${r.status}`;
+      }
+    } catch (e) {
+      if (e.loginNeeded) loginNeeded = true;
+      loginDetail = e.message;
+    }
     const loc = getLocation();
     return text({
       loginNeeded,
+      loginVerified,
       ...(loginDetail ? { loginDetail } : {}),
       ...describeTokens(),
       location: loc || { label: "not set (estimated from IP on first search)", hint: "use_saved_address sets it from the user's saved Wolt addresses; set_location takes a spoken address" },
@@ -908,5 +993,7 @@ server.tool(
   }
 );
 
-await server.connect(new StdioServerTransport());
-console.error("wolt-mcp server running on stdio");
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await server.connect(new StdioServerTransport());
+  console.error("wolt-mcp server running on stdio");
+}

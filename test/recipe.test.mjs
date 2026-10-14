@@ -45,6 +45,10 @@ const cases = [
   ["2 gerezd fokhagyma", 2, "gerezd", "fokhagyma"],          // Hungarian
   ["2 κ.σ. ελαιόλαδο", 2, "κσ", "ελαιόλαδο"],                // Greek, dots inside the abbreviation
   ["500 г говядины", 500, "г", "говядины"],                  // Russian
+  ["2 л молока", 2, "л", "молока"],
+  ["1200 გ ქათამი", 1200, "გ", "ქათამი"],
+  ["1.2 კგ ქათამი", 1.2, "კგ", "ქათამი"],
+  ["2 ლ რძე", 2, "ლ", "რძე"],
   ["2 ст.л. оливкового масла", 2, "стл", "оливкового масла"],// Russian abbreviation
   ["2 cucharadas de aceite de oliva", 2, "cucharadas", "aceite de oliva"], // Spanish, "de" stripped
   ["800 גרם עגבניות", 800, "גרם", "עגבניות"],                 // Hebrew

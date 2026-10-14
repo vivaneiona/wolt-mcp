@@ -47,7 +47,9 @@ function assertPlanShape(name, plan, { language, ingredients, currency = "EUR" }
   assert(plan, `${name}: a plan for the pinned store`);
   assert.equal(plan.venue.catalogLanguage, language, `${name}: catalog language`);
   assert.equal(plan.venue.currency, currency, `${name}: currency resolved from the venue, not a default`);
-  if (plan.lineItems.length) {
+  if (plan.lineItems.some((li) => li.quantityNeedsReview)) {
+    assert.equal(plan.basket, null, `${name}: uncertain package quantities must be reviewed before building a basket`);
+  } else if (plan.lineItems.length) {
     assert.equal(plan.basket.currency, currency);
     assert(isVenueObjectId(plan.basket.venue_id), `${name}: basket carries a real venue id, never a slug`);
     assert.equal(plan.basket.items.length, plan.lineItems.length);

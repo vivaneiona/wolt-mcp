@@ -142,13 +142,13 @@ export function selectBestVenue(perIngredient) {
 }
 
 // Build the POST /baskets body (matches the schema proven in the spike).
-// selections: [{ candidate, count, grams?, options? }] where options follows
+// selections: [{ candidate, count, grams?, options?, allowSubstitution? }] where options follows
 // the basket shape: [{id: groupId, values: [{id, count, price}]}].
 // currency is required: resolve it with resolveCurrency() and refuse the write
 // when that comes back null, rather than defaulting to some market's money.
 export function buildBasketBody(selections, venueId, currency) {
   if (!currency) throw new Error("basket currency unknown — pass the currency from the search results (e.g. 'EUR')");
-  const items = selections.map(({ candidate, count = 1, grams, options }) => {
+  const items = selections.map(({ candidate, count = 1, grams, options, allowSubstitution = false }) => {
     const item = {
       id: candidate.itemId,
       count,
@@ -158,7 +158,7 @@ export function buildBasketBody(selections, venueId, currency) {
         id: o.id,
         values: (o.values || []).map((v) => ({ id: v.id, count: v.count > 0 ? v.count : 1, price: v.price || 0 }))
       })),
-      substitution_settings: { is_allowed: true }
+      substitution_settings: { is_allowed: allowSubstitution === true }
     };
     if (candidate.isWeighted) {
       item.weighted_item_info = {
@@ -192,9 +192,10 @@ export function findBasketForVenue(page, venueId) {
 // preserving options and substitution settings (matches the web
 // client's upsert shape).
 export function upsertItemFromLine(line, count = null) {
+  const quantity = count ?? (line.count > 0 ? line.count : 1);
   return {
     id: line.id,
-    count: count ?? (line.count > 0 ? line.count : 1),
+    count: quantity,
     name: line.name || "",
     price: line.price || 0,
     options: (line.options || []).map((o) => ({
@@ -202,19 +203,44 @@ export function upsertItemFromLine(line, count = null) {
       values: (o.values || []).map((v) => ({ id: v.id, count: v.count > 0 ? v.count : 1, price: v.price || 0 }))
     })),
     substitution_settings: { is_allowed: !!line.substitution_settings?.is_allowed },
-    ...(line.weighted_item_info ? { weighted_item_info: line.weighted_item_info } : {})
+    ...(line.weighted_item_info ? { weighted_item_info: { ...line.weighted_item_info, count: quantity } } : {})
   };
+}
+
+// Option ordering and prices do not change which variant the user selected.
+export function basketItemKey(item) {
+  const options = (item.options || []).map((o) => ({
+    id: o.id,
+    values: (o.values || []).map((v) => ({ id: v.id, count: v.count > 0 ? v.count : 1 }))
+      .sort((a, b) => a.id.localeCompare(b.id))
+  })).sort((a, b) => a.id.localeCompare(b.id));
+  return JSON.stringify([item.id, options]);
 }
 
 // POST /baskets REPLACES the venue's basket wholesale, so adds must be
 // read-merge-write: existing lines are carried over, and a new line whose item
-// id already exists bumps that line's count instead of duplicating it.
+// id already exists bumps that line's count. Different options must not be lost.
 export function mergeBasketItems(existingLines, newItems) {
   const merged = (existingLines || []).map((line) => upsertItemFromLine(line));
-  for (const item of newItems) {
+  for (const line of newItems) {
+    const item = upsertItemFromLine(line);
     const existing = merged.find((m) => m.id === item.id);
-    if (existing) existing.count += item.count > 0 ? item.count : 1;
-    else merged.push(item);
+    if (!existing) { merged.push(item); continue; }
+    if (basketItemKey(existing) !== basketItemKey(item)) {
+      throw new Error(`item ${item.id} is already in the basket with different options — change or remove that line before adding another variant`);
+    }
+    const oldWeight = existing.weighted_item_info;
+    const newWeight = item.weighted_item_info;
+    if (!!oldWeight !== !!newWeight) throw new Error(`item ${item.id} has conflicting count/weight information — refresh its catalog details before adding it`);
+    existing.count += item.count;
+    if (oldWeight) {
+      const oldGrams = oldWeight.purchased_weight_in_grams;
+      const newGrams = newWeight.purchased_weight_in_grams;
+      if (!(oldGrams > 0) || !(newGrams > 0)) throw new Error(`item ${item.id} has no valid purchased weight — nothing was merged`);
+      // Grams are the total requested for each line, not a per-count amount.
+      existing.weighted_item_info = { ...oldWeight, count: existing.count, purchased_weight_in_grams: oldGrams + newGrams };
+    }
+    existing.substitution_settings.is_allowed = existing.substitution_settings.is_allowed && item.substitution_settings.is_allowed;
   }
   return merged;
 }

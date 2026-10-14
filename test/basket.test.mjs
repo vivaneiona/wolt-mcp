@@ -1,7 +1,7 @@
 // Confirms buildBasketBody produces the exact shape Wolt accepted (HTTP 200) in
 // the spike. Guards the cart-write payload without needing a live session.
 import assert from "node:assert";
-import { buildBasketBody, snapGrams, reconcileWeightedItems, resolveCurrency, currencyForCountry } from "../mcp/lib/wolt.js";
+import { buildBasketBody, snapGrams, reconcileWeightedItems, resolveCurrency, currencyForCountry, upsertItemFromLine, mergeBasketItems, basketItemKey } from "../mcp/lib/wolt.js";
 
 // Two candidates: a packaged item and a by-weight item (like the spike's beef).
 const packaged = { itemId: "5dab92633e2a06d6d9ffc9fb", name: "Crushed tomatoes, 800 g", price: 1450, currency: "EUR", isWeighted: false };
@@ -26,8 +26,10 @@ assert.deepEqual(body.items[0], {
   name: "Crushed tomatoes, 800 g",
   price: 1450,
   options: [],
-  substitution_settings: { is_allowed: true }
+  substitution_settings: { is_allowed: false }
 });
+
+assert.equal(buildBasketBody([{ candidate: packaged, allowSubstitution: true }], "v", "EUR").items[0].substitution_settings.is_allowed, true);
 
 // weighted item — carries weighted_item_info like the spike's ground beef
 assert.deepEqual(body.items[1].weighted_item_info, {
@@ -40,6 +42,54 @@ assert.equal(body.items[1].id, "5dcfbc56e12e702ee5e712e4");
 // grams defaulting: no explicit grams -> derive from unit size text
 const defaulted = buildBasketBody([{ candidate: weighted, count: 1 }], "v", "EUR");
 assert.equal(defaulted.items[0].weighted_item_info.purchased_weight_in_grams, 500);
+
+// Repeated weighted adds sum requested grams and keep both counts consistent.
+{
+  const existing = buildBasketBody([{ candidate: weighted, count: 1, grams: 500, allowSubstitution: true }], "v", "EUR").items;
+  const added = buildBasketBody([{ candidate: weighted, count: 2, grams: 1000 }], "v", "EUR").items;
+  const before = structuredClone([existing, added]);
+  const [merged] = mergeBasketItems(existing, added);
+  assert.equal(merged.count, 3);
+  assert.equal(merged.weighted_item_info.count, 3);
+  assert.equal(merged.weighted_item_info.purchased_weight_in_grams, 1500);
+  assert.equal(merged.substitution_settings.is_allowed, false, "new opt-out also applies to an existing line");
+  assert.deepEqual([existing, added], before, "merging does not mutate either input");
+  const updated = upsertItemFromLine(existing[0], 4);
+  assert.equal(updated.count, 4);
+  assert.equal(updated.weighted_item_info.count, 4);
+  assert.equal(updated.weighted_item_info.purchased_weight_in_grams, 500, "count-only helper never invents grams");
+  assert.notEqual(updated.weighted_item_info, existing[0].weighted_item_info);
+  assert.throws(() => mergeBasketItems(existing, [{ ...added[0], weighted_item_info: undefined }]), /conflicting count\/weight/);
+  assert.throws(() => mergeBasketItems(existing, [{ ...added[0], weighted_item_info: { count: 2 } }]), /valid purchased weight/);
+}
+
+// Preserve the stricter substitution preference and ordinary packaged counts.
+{
+  const existing = buildBasketBody([{ candidate: packaged, count: 2 }], "v", "EUR").items;
+  const added = buildBasketBody([{ candidate: packaged, count: 1, allowSubstitution: true }], "v", "EUR").items;
+  const [merged] = mergeBasketItems(existing, added);
+  assert.equal(merged.count, 3);
+  assert.equal(merged.substitution_settings.is_allowed, false, "adding never relaxes an existing opt-out");
+  assert.equal(mergeBasketItems(added, added)[0].substitution_settings.is_allowed, true);
+}
+
+// The same item with different options cannot silently become the old variant.
+{
+  const options = [
+    { id: "size", values: [{ id: "large", count: 1, price: 100 }] },
+    { id: "extras", values: [{ id: "tomato", count: 1 }, { id: "onion", count: 2 }] }
+  ];
+  const original = buildBasketBody([{ candidate: packaged, options }], "v", "EUR").items[0];
+  const reordered = { ...original, options: [...original.options].reverse().map((o) => ({ ...o, values: [...o.values].reverse() })) };
+  assert.equal(basketItemKey(original), basketItemKey(reordered));
+  assert.equal(mergeBasketItems([original], [reordered])[0].count, 2);
+  const different = buildBasketBody([{ candidate: packaged, options: [{ id: "size", values: [{ id: "small" }] }] }], "v", "EUR").items[0];
+  assert.throws(() => mergeBasketItems([original], [different]), /different options/);
+  assert.throws(() => mergeBasketItems([], [original, different]), /different options/, "same rule for duplicates within a new batch");
+  const moreOptions = structuredClone(original);
+  moreOptions.options[0].values[0].count = 2;
+  assert.throws(() => mergeBasketItems([original], [moreOptions]), /different options/);
+}
 
 // currency is never invented: no currency in, no basket out.
 assert.throws(() => buildBasketBody([{ candidate: packaged, count: 1 }], "v", null), /currency/i, "missing currency must fail loudly");

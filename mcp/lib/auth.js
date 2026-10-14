@@ -129,8 +129,9 @@ export async function refreshAccessToken() {
   const state = currentState();
   // Latest rotation first (freshest for our chain), pinned bootstrap second.
   const candidates = [...new Set([state.rotatedRefreshToken, state.refreshToken].filter(Boolean))];
-  if (!candidates.length) throw new Error("no refresh token stored");
+  if (!candidates.length) throw Object.assign(new Error("no refresh token stored"), { loginNeeded: true });
   let lastErr = null;
+  let loginNeeded = true;
   for (const candidate of candidates) {
     try {
       const { access, refresh } = await postRefresh(candidate);
@@ -138,9 +139,13 @@ export async function refreshAccessToken() {
       state.accessToken = access;
       saveState(state);
       return access;
-    } catch (e) { lastErr = e; }
+    } catch (e) {
+      lastErr = e;
+      if (![400, 401, 403].includes(e.status)) loginNeeded = false;
+    }
   }
-  const err = new Error(`token refresh failed: ${lastErr.message} — paste a fresh token with set_wolt_token`);
+  const err = new Error(`token refresh failed: ${lastErr.message} — ${loginNeeded ? "reconnect with login_via_chrome or set_wolt_token" : "retry when Wolt is reachable"}`);
+  err.loginNeeded = loginNeeded;
   if (lastErr.status) err.status = lastErr.status;
   throw err;
 }
@@ -156,7 +161,7 @@ export async function getAccessToken() {
   if (state.accessToken && !exp) return state.accessToken;
   if (state.refreshToken) return refreshAccessToken();
   if (state.accessToken && exp && exp > Date.now()) return state.accessToken; // inside margin but alive
-  throw new Error(NEEDS_TOKEN_MESSAGE(!!state.accessToken));
+  throw Object.assign(new Error(NEEDS_TOKEN_MESSAGE(!!state.accessToken)), { loginNeeded: true });
 }
 
 // Snapshot/restore the whole token store. Used by the browser login: a stale

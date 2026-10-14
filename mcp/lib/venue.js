@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { woltFetch } from "./http.js";
 import { rankCandidates } from "./match.js";
+import { langOf } from "./lang.js";
 
 const VENUE_STATIC_BASE = "https://consumer-api.wolt.com/order-xp/web/v1/pages/venue/slug/";
 const ASSORTMENT_BASE = "https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/";
@@ -133,17 +134,23 @@ export async function resolveItem(slug, ref) {
   const wantedId = /^[a-f0-9]{24}$/.test(String(ref)) ? String(ref) : fromUrl.itemId;
   const venueSlug = slug || fromUrl.slug;
   if (!venueSlug) throw new Error("no venue slug: pass venue_slug, or an item URL containing /venue/<slug>/");
-  const { items } = await getMenu(venueSlug, { limit: Infinity });
   if (wantedId) {
-    const hit = items.find((it) => it.itemId === wantedId);
+    // Partial catalogs omit items at the top level; resolve exact ids directly.
+    const r = await woltFetch(`${ASSORTMENT_BASE}${venueSlug}/assortment/items`, { method: "POST", body: { item_ids: [wantedId] }, auth: false });
+    if (!r.ok) throw new Error(`item fetch failed for "${venueSlug}": HTTP ${r.status}`);
+    const hit = (r.json?.items || []).find((it) => it.id === wantedId);
     if (!hit) throw new Error(`item ${wantedId} not found in "${venueSlug}" (it may be unavailable at this hour)`);
-    return hit;
+    return normalizeMenuItem(hit);
   }
   if (String(ref).includes("wolt.com")) {
     throw new Error(`that Wolt link has no item id in it — open the specific item on wolt.com and copy the URL containing "itemid-…", or search by name with get_venue_menu`);
   }
   const q = String(ref || "").toLowerCase().trim();
   if (!q) throw new Error("provide an item id, item URL, or name");
+  const a = await getAssortment(venueSlug);
+  const items = (a.loading_strategy === "partial" || !a.items?.length
+    ? await searchAssortmentItems(venueSlug, q, langOf(q))
+    : a.items).map(normalizeMenuItem);
   const exact = items.filter((it) => (it.name || "").toLowerCase() === q);
   const matches = exact.length ? exact : items.filter((it) => (it.name || "").toLowerCase().includes(q));
   if (!matches.length) {

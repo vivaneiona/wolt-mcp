@@ -61,6 +61,36 @@ export function rankPlans(plans, total) {
   return { best: pool[0] || null, allDegraded: plans.length > 0 && !qualified.length };
 }
 
+const GRAM_UNITS = new Set(["g", "gram", "grams", "γρ", "γραμμάρια", "г", "гр", "грамм", "граммов", "გ", "გრამი", "גרם", "ג\""]);
+const KILO_UNITS = new Set(["kg", "kilogram", "kilograms", "κιλό", "κιλά", "кг", "კგ", "კილოგრამი", "קילו", "ק\"ג"]);
+const COUNT_UNITS = new Set([
+  "can", "cans", "tin", "tins", "jar", "jars", "package", "packages", "packet", "pack",
+  "packung", "dose", "stück", "kpl", "pkt", "prk", "tlk", "pussi", "st", "stk", "pk", "burk", "boks",
+  "opakowanie", "puszka", "słoik", "szt", "balení", "konzerva", "ks", "csomag", "konzerv", "db",
+  "συσκευασία", "κονσέρβα", "τεμάχιο", "τεμάχια", "упаковка", "банка", "шт", "дана", "ცალი", "შეფუთვა",
+  "paquete", "lata", "unidad", "unidades", "יחידה", "יחידות", "חבילה", "חבילות", "קופסה"
+]);
+
+export function quantityForItem(raw, candidate) {
+  const { quantity, unit } = parseIngredientLine(raw);
+  if (quantity == null) {
+    return candidate.isWeighted
+      ? { count: 1, grams: snapGrams(500, candidate.sellByWeight?.gramsPerStep) }
+      : { count: 1 };
+  }
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    return { quantityNeedsReview: "The requested quantity must be positive." };
+  }
+  if (candidate.isWeighted && (GRAM_UNITS.has(unit) || KILO_UNITS.has(unit))) {
+    return { count: 1, grams: snapGrams(quantity * (KILO_UNITS.has(unit) ? 1000 : 1), candidate.sellByWeight?.gramsPerStep) };
+  }
+  if (!candidate.isWeighted && (unit == null || COUNT_UNITS.has(unit)) && Number.isSafeInteger(quantity)) {
+    return { count: quantity };
+  }
+  // shortcut: package sizes and piece weights are not inferred from names; add structured sizing before converting them.
+  return { quantityNeedsReview: `Cannot convert ${quantity}${unit ? ` ${unit}` : " pieces"} to ${candidate.isWeighted ? "a weight" : "whole packages"} from this catalog data. Check the package size or weight and pass explicit count/grams to add_to_cart.` };
+}
+
 // Plan a whole ingredient list against ONE venue's own catalog. Returns the
 // same shape whether called for a pinned store or as one contestant of the
 // multi-store race in plan_cart's auto mode.
@@ -111,6 +141,7 @@ export async function planAtVenue(venue_slug, ingredients) {
           : null;
       lineItems.push({
         ingredient: raw, name: best.name, itemId: best.itemId, price: best.price,
+        ...quantityForItem(raw, best),
         confidence: check ? "low" : "high",
         ...(check ? { check } : {}),
         ...(best.isWeighted ? { isWeighted: true, sellByWeight: best.sellByWeight } : {}),
@@ -120,16 +151,15 @@ export async function planAtVenue(venue_slug, ingredients) {
       unmatched.push({ ingredient: raw, candidates: hits.slice(0, 3).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price })) });
     } else missing.push(raw);
   }
-  // Weighted lines get a valid default weight (500g snapped up onto the item's
-  // step) — an off-step weight would be silently dropped at write time.
+  // Do not hand back a ready basket when any requested quantity is unresolved.
   // No currency anywhere (venue record and market map both blank) -> no
   // prebuilt basket; add_to_cart then asks for one instead of guessing.
   const currency = resolveCurrency({ venue });
-  const basket = lineItems.length && currency
+  const basket = lineItems.length && currency && !lineItems.some((li) => li.quantityNeedsReview)
     ? buildBasketBody(lineItems.map((li) => ({
         candidate: { itemId: li.itemId, name: li.name, price: li.price, isWeighted: !!li.isWeighted },
-        count: 1,
-        ...(li.isWeighted ? { grams: snapGrams(500, li.sellByWeight?.gramsPerStep) } : {})
+        count: li.count,
+        ...(li.isWeighted ? { grams: li.grams } : {})
       })), venue.venueId, currency)
     : null;
   // Warn only on cross-script mismatches: Latin-vs-Latin (English lines at a
@@ -141,7 +171,9 @@ export async function planAtVenue(venue_slug, ingredients) {
   return {
     venue: { venueId: venue.venueId, slug: venue_slug, name: venue.name, currency: venue.currency, catalogLanguage },
     coverageCount: lineItems.length,
-    cost: lineItems.reduce((s, li) => s + (li.price || 0), 0),
+    cost: lineItems.reduce((s, li) => s + (li.quantityNeedsReview ? Infinity
+      : li.isWeighted && li.sellByWeight?.pricePerKg != null ? li.sellByWeight.pricePerKg * li.grams / 1000
+        : (li.price || 0) * li.count), 0),
     searchErrors,
     ...(rateLimited ? { rateLimited: true } : {}),
     ...(offLanguage
@@ -157,6 +189,7 @@ export async function planAtVenue(venue_slug, ingredients) {
 export function planResponse(plan, total) {
   const lowCoverage = plan.coverageCount < Math.ceil(total * 0.7);
   const uncertain = plan.lineItems.filter((li) => li.confidence === "low");
+  const quantityReview = plan.lineItems.filter((li) => li.quantityNeedsReview);
   return {
     venue: plan.venue,
     coverage: `${plan.coverageCount}/${total}`,
@@ -181,8 +214,13 @@ export function planResponse(plan, total) {
     missing: plan.missing,
     ...(plan.unmatched.length ? { unmatched: plan.unmatched, unmatchedNote: "The store returned these candidates but token scoring couldn't confirm them — judge each by meaning and add the good ones to the basket yourself (never a flavored/imitation substitute)." } : {}),
     basket: plan.basket,
+    ...(quantityReview.length
+      ? { quantityReview: quantityReview.map((li) => ({ ingredient: li.ingredient, picked: li.name, why: li.quantityNeedsReview })) }
+      : {}),
     ...(!plan.basket && plan.lineItems.length
-      ? { basketNote: "No currency on record for this venue — call add_to_cart with an explicit currency taken from search_products results." }
+      ? { basketNote: quantityReview.length
+          ? "No ready basket: resolve the flagged quantities before add_to_cart; do not assume one package or 500 g."
+          : "No currency on record for this venue — call add_to_cart with an explicit currency taken from search_products results." }
       : {}),
     ...(plan.missing.length ? { note: "Missing items may just be a phrasing miss — retry them in the store's catalog language and in dictionary form (singular nominative, as a shelf label reads; catalog search matches prefixes, so an inflected word finds little), or drop them." } : {})
   };

@@ -7,7 +7,7 @@
 import assert from "node:assert";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, symlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,12 +15,19 @@ import { createRequire } from "node:module";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const { version } = createRequire(import.meta.url)("../package.json");
+const stateDir = mkdtempSync(join(tmpdir(), "wolt-boot-"));
+// npm bin entries are symlinks; an import-safe entry point must still start through one.
+const entry = join(stateDir, "server-entry.mjs");
+symlinkSync(join(HERE, "..", "server.mjs"), entry);
+const env = { ...process.env, WOLT_STATE_DIR: stateDir };
+delete env.WOLT_BEARER_TOKEN;
+delete env.WOLT_REFRESH_TOKEN;
 
 const transport = new StdioClientTransport({
   command: process.execPath,
-  args: [join(HERE, "..", "server.mjs")],
+  args: [entry],
   // A throwaway state dir: booting must never read or write the real one.
-  env: { ...process.env, WOLT_STATE_DIR: mkdtempSync(join(tmpdir(), "wolt-boot-")) }
+  env
 });
 const client = new Client({ name: "boot", version: "1" }, { capabilities: {} });
 await client.connect(transport);
@@ -39,4 +46,5 @@ const info = client.getServerVersion();
 assert.equal(info?.version, version, `server reports ${info?.version}, package.json says ${version}`);
 
 await client.close();
+rmSync(stateDir, { recursive: true, force: true });
 console.log(`boot.test.mjs: server starts and serves ${tools.length} tools at v${version}`);
