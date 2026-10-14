@@ -36,7 +36,7 @@ const { tools } = await client.listTools();
 assert(tools.length >= 25, `expected the full tool surface, got ${tools.length}`);
 
 // The ones the documented flow depends on, by name.
-for (const name of ["wolt_status", "search_products", "plan_cart", "add_to_cart", "checkout_preview", "use_saved_address"]) {
+for (const name of ["wolt_status", "search_products", "plan_cart", "add_to_cart", "checkout_preview", "use_saved_address", "login_via_existing_chrome"]) {
   assert(tools.some((t) => t.name === name), `missing tool: ${name}`);
 }
 // Every tool needs a description — they are the prompt the client model reads.

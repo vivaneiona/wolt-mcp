@@ -45,6 +45,8 @@ This needs a **Chromium-based browser** — Chrome, Edge, Brave, Vivaldi, or Chr
 
 Tokens are stored locally (`~/.wolt-mcp/tokens.json`, mode 600). Automatic refresh can fail if a session expires or is revoked; `wolt_status` checks the login live. Env vars `WOLT_BEARER_TOKEN` / `WOLT_REFRESH_TOKEN` work as initial seeds; `WOLT_LAT` / `WOLT_LON` seed the search location.
 
+**Use your existing Chrome login:** `login_via_existing_chrome` supports Chrome 144+. Enable remote debugging yourself at `chrome://inspect/#remote-debugging`, keep a signed-in Wolt tab open, then approve Chrome's connection prompt yourself. The permission is browser-wide; the tool requests only Wolt cookies and disconnects before validating/storing the session. It reads only `DevToolsActivePort` connection metadata from disk, not cookie databases, and never copies a profile or closes Chrome. Disable remote debugging afterwards if you no longer need it. `WOLT_CHROME_USER_DATA_DIR` selects a custom user-data directory; the default is the standard Chrome directory. Chrome determines which profile is shared, so verify the account with `get_wolt_profile` before changing a basket. This reuses Wolt's session: later expiry or token rotation can still require reconnection.
+
 Searching stores needs no login. Account access and basket changes do. `use_saved_address` requires `address_id` when several saved addresses exist. It sets the search and estimate location, **not** the delivery address selected at checkout.
 
 ## Tools
@@ -56,6 +58,8 @@ Searching stores needs no login. Account access and basket changes do. `use_save
 **Cart** — `plan_cart` (recipe → single-store plan), `add_to_cart` (merge and verify, supports dish options), `get_baskets`, `update_cart_item`, `clear_basket`, `checkout_preview` (estimate incl. fees; never orders).
 
 **Account** — `get_wolt_profile`, `use_saved_address`, `get_order_history`, `get_order`, `get_payment_methods`, `get_favorites`, `add_favorite`, `remove_favorite`, `resolve_address`, `set_location`, `wolt_status`.
+
+**Connect** — `login_via_chrome` (separate profile), `login_via_existing_chrome` (existing Chrome 144+ session), `set_wolt_token` (manual fallback).
 
 ## Try it
 

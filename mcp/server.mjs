@@ -27,6 +27,7 @@ import { setTokens, describeTokens, getAccessToken } from "./lib/auth.js";
 import { getLocation, setLocation, estimateLocation } from "./lib/config.js";
 import { checkoutPreview } from "./lib/checkout.js";
 import { cdpLogin } from "./lib/cdp-login.js";
+import { existingChromeLogin } from "./lib/existing-chrome.js";
 import { getVenue, getMenu, getItemOptions, getCategories, resolveItem, parseItemUrl, searchVenueItems, getCatalogLanguage, getMarketLanguage, getWeightConfigs } from "./lib/venue.js";
 import { getOrderHistory, getOrder, geocodeAddress } from "./lib/account.js";
 import { langOf, sameScript, isNonLatinLang } from "./lib/lang.js";
@@ -907,6 +908,18 @@ server.tool(
     } catch (e) {
       return errText(`Browser login didn't complete: ${e.message}\nIf they use a non-Chrome Chromium browser (Edge, Brave, Vivaldi, Chromium), set CHROME_BIN to its binary and retry.\nFallback for Firefox/Safari users, or if no Chromium browser is installed: ask the user to paste a Wolt refresh token and store it with set_wolt_token (see the README).`);
     }
+  }
+);
+
+server.tool(
+  "login_via_existing_chrome",
+  "Connect the Wolt session already signed into ordinary Chrome 144+, without another Wolt login. Explain first: the user must enable remote debugging at chrome://inspect/#remote-debugging and personally approve Chrome's connection prompt; that permission is browser-wide, although this tool only reads Wolt login cookies from an HTTPS Wolt tab. Never enable debugging or approve the prompt on the user's behalf. Reads only DevToolsActivePort metadata from disk, not browser cookie databases; never copies a profile, launches/closes Chrome, or navigates tabs. Disconnects after reading the cookie, validates it with Wolt, and only then stores tokens locally. Keep a signed-in wolt.com tab open in the profile Chrome shares. Defaults to the standard Chrome user-data directory; WOLT_CHROME_USER_DATA_DIR overrides it. Allow up to 2 minutes for approval. After success, verify the account with wolt_status/get_wolt_profile and use_saved_address before changing a basket.",
+  {},
+  async () => {
+    try {
+      const { via, tokenState } = await existingChromeLogin();
+      return text({ ok: true, connectedVia: via, ...tokenState });
+    } catch (error) { return errText(error.message); }
   }
 );
 

@@ -30,11 +30,13 @@ For Claude Code: `claude mcp add wolt-mcp -- node /absolute/path/to/wolt-mcp/mcp
 
 Then in chat: *"Connect my Wolt account"* → sign in to the separate browser profile → *"use my saved Wolt address"* → choose the requested address if several exist. Login needs a Chromium-based browser; Firefox/Safari users can supply a token instead. Search location does **not** change the address selected at Wolt checkout.
 
+Already signed into Wolt in **Chrome 144+**? Use `login_via_existing_chrome`: open `chrome://inspect/#remote-debugging`, enable remote debugging yourself, leave your Wolt tab open, and personally approve Chrome's connection prompt. Chrome grants browser-wide debugging access; this tool requests cookies only for Wolt, disconnects immediately after reading them, and validates the login before replacing stored tokens. It does not restart Chrome, copy a profile, or read cookie databases. You can turn remote debugging off after connecting. See [existing-session setup](docs/setup.md#use-your-existing-chrome-session).
+
 Full walkthrough in [docs/setup.md](docs/setup.md); internals in [docs/architecture.md](docs/architecture.md).
 
 ## What it does
 
-29 tools across:
+30 tools across:
 
 - **Find** — grocery products, restaurant dishes, venues, a filtered "what's good and open near me" ranking, the discovery feed, and item lookup by name or wolt.com URL.
 - **Browse** — venue details and opening hours, category trees, full menus (including large grocery catalogs), and dish option groups with required/conditional choices.

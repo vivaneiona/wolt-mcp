@@ -199,6 +199,7 @@ if (stored?.accessToken) {
   skip("set_wolt_token", "no tokens.json to round-trip safely");
 }
 skip("login_via_chrome", "interactive — cannot be driven headlessly");
+skip("login_via_existing_chrome", "interactive — requires the user's Chrome permission");
 
 // tokens must survive this harness untouched — verify a real authed call still works
 await call("wolt_status", {}, (j) => j.refreshTokenStored === true);

@@ -40,6 +40,22 @@ Tokens are stored locally (`~/.wolt-mcp/tokens.json`, mode 600) and sent only to
 
 Searching stores needs no login; reading your account or baskets and changing baskets does.
 
+### Use your existing Chrome session
+
+With **Chrome 144+**, `login_via_existing_chrome` connects to the Wolt account already open in your ordinary Chrome profile:
+
+1. Keep a signed-in `https://wolt.com` tab open.
+2. Open `chrome://inspect/#remote-debugging` and enable remote debugging yourself.
+3. Ask the client to call `login_via_existing_chrome`, then personally approve Chrome's connection prompt. Allow up to two minutes for this step; set your MCP client's tool timeout to at least 180 seconds.
+4. Verify the account with `wolt_status` and `get_wolt_profile`, then select the intended saved address. Chrome chooses the shared profile; with multiple profiles, check that it is the right one.
+5. You can disable remote debugging after connecting. MCP keeps its Wolt tokens locally and uses the existing refresh flow.
+
+Chrome's permission grants browser-wide debugging access. This tool requests cookies only for Wolt, closes its WebSocket immediately after reading them, and validates the refresh token before replacing the stored account. It never closes or navigates your tabs, copies a browser profile, or reads a cookie database. The shared Wolt session may still expire or be revoked; reconnect if needed.
+
+The only file read from Chrome is `DevToolsActivePort`, which contains the local connection endpoint. The standard Chrome user-data directory is detected on macOS, Windows and Linux; `WOLT_CHROME_USER_DATA_DIR` overrides it. Set this to the **user-data root**, not its `Default` or `Profile 1` subdirectory. If the OS denies access to that metadata, grant the MCP host application access to Google Chrome in OS privacy settings; the tool does not change permissions itself. If Chrome is too old or you do not want browser-wide debugging access, use the separate-profile `login_via_chrome` instead.
+
+This uses Chrome's [existing-session permission flow](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session), not the legacy `--remote-debugging-port` flag. The latter no longer works with the standard profile in Chrome 136+. No extension or additional npm dependency is needed.
+
 ## 3. Set your delivery location
 
 Say **"use my saved Wolt address"**. `use_saved_address` selects a single saved address automatically. With several addresses it returns the choices without selecting one; call again with the requested `address_id`. Alternatively, resolve a spoken address with `resolve_address` and save its coordinates with `set_location`. Searches default to this location. If none is set, browsing may estimate a city from your IP. Basket writes require a saved search location; check that it matches the intended address.
@@ -87,6 +103,7 @@ New lines prohibit substitutions unless you explicitly pass `allow_substitution:
 | `clear_basket` | yes | Delete a basket |
 | `checkout_preview` | yes | Estimate incl. fees/delivery — read-only, never orders |
 | `login_via_chrome` / `set_wolt_token` | — | Connect your account |
+| `login_via_existing_chrome` | Chrome approval | Reuse the signed-in Wolt session in ordinary Chrome 144+ |
 | `get_wolt_profile` | yes | Name/email/phone; use `use_saved_address` for addresses |
 | `set_location` | no | Save search/estimate coordinates; does not change checkout |
 | `wolt_status` | optional | Live login verification and configured search location |

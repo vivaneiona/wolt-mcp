@@ -35,6 +35,8 @@ export const NEEDS_TOKEN_MESSAGE = (hadExpired) =>
   `you log in normally, and that's it. You only do this once; it renews itself afterwards. ` +
   `Note the window uses a separate, empty browser profile, so you'll sign into Wolt fresh there — ` +
   `your everyday profile isn't touched. Needs Chrome, Edge, Brave or another Chromium browser.\n\n` +
+  `If Wolt is already signed into ordinary Chrome 144+, offer login_via_existing_chrome instead: ` +
+  `the user enables remote debugging at chrome://inspect/#remote-debugging and personally approves Chrome's browser-wide connection prompt.\n\n` +
   `On Firefox or Safari, they can instead open a logged-in wolt.com tab, go to DevTools → Network, ` +
   `find a POST to authentication.wolt.com/v1/wauth2/access_token, copy "refresh_token" from the request ` +
   `payload, and paste it here — I'll store it with set_wolt_token.\n\n` +
@@ -65,9 +67,6 @@ function currentState() {
   const envRefresh = process.env.WOLT_REFRESH_TOKEN || null;
   if (envAccess && !state.accessToken) state.accessToken = envAccess;
   if (envRefresh && !state.refreshToken) state.refreshToken = envRefresh;
-  // env access token newer than the stored one (user pasted a fresh one) → take it
-  const envExp = jwtExpiryMs(envAccess), storedExp = jwtExpiryMs(state.accessToken);
-  if (envAccess && envExp && (!storedExp || envExp > storedExp)) state.accessToken = envAccess;
   return state;
 }
 
@@ -108,7 +107,8 @@ async function postRefresh(refreshToken) {
   const res = await fetch(AUTH_URL, {
     method: "POST",
     headers: { ...woltHeaders(), "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken })
+    body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken }),
+    signal: AbortSignal.timeout(15000)
   });
   const body = await res.text();
   if (!res.ok) {
@@ -123,6 +123,19 @@ async function postRefresh(refreshToken) {
   const access = json.access_token || json.accessToken;
   if (!access) throw new Error("token refresh returned no access_token");
   return { access, refresh: json.refresh_token || json.refreshToken || null };
+}
+
+// Validate the imported session before replacing a previously working account.
+export async function connectRefreshToken(raw) {
+  const refreshToken = unwrapToken(raw);
+  let tokens;
+  try { tokens = await postRefresh(refreshToken); }
+  catch (error) {
+    // Auth error bodies can echo credentials; never include them in MCP output.
+    throw new Error(`Wolt could not validate the Chrome session${error.status ? ` (HTTP ${error.status})` : ""}. Stored tokens were not changed.`);
+  }
+  saveState({ ...currentState(), refreshToken, rotatedRefreshToken: tokens.refresh, accessToken: tokens.access });
+  return describeTokens();
 }
 
 export async function refreshAccessToken() {

@@ -16,6 +16,7 @@ mcp/lib/
   checkout.js      checkout preview payload + category enrichment
   account.js       order history, geocoding
   cdp-login.js     zero-paste browser login over the DevTools Protocol
+  existing-chrome.js  user-approved connection to ordinary Chrome 144+
   config.js        saved location
 ```
 
@@ -38,6 +39,8 @@ No `Origin`, `Referer`, or User-Agent spoofing is needed — plain server-side H
 ## Auth
 
 Wolt's web session issues a short-lived (~30 min) access JWT plus a refresh token, exchanged at `POST authentication.wolt.com/v1/wauth2/access_token` with `grant_type=refresh_token` — no client_id, no cookies.
+
+`login_via_existing_chrome` reads `DevToolsActivePort` metadata and connects directly to the loopback WebSocket after the user enables Chrome's remote debugging UI and approves its prompt. This mode does not use HTTP discovery. It attaches only to an HTTPS Wolt page, requests Wolt-scoped cookies with `Network.getCookies`, disconnects, then validates the refresh token before saving it. It neither reads browser cookie databases nor launches/closes the browser. The default separate-profile login remains available.
 
 Three things are easy to get wrong:
 
@@ -100,7 +103,7 @@ a silent pricing bug, not a recoverable one.
 - From `mcp/`, `npm test` runs the offline suite (no live account or network), including mocked basket/account flows, quantity planning, catalog lookup and the release version guard. The following `node test/...` paths are relative to the repository root.
 - `node test/replay.test.mjs` (part of `npm test`) — plans a full shopping list against **recorded catalogs** in three markets, with global `fetch` disabled so a pass can't depend on Wolt being up. Covers store racing, in-venue matching, catalog language, currency resolution and basket assembly. Cassettes are recorded by `node test/record-cassette.mjs`; recording refuses any non-catalog endpoint, so a fixture can never contain account, order or auth traffic. Both the recorder and the test drive the same flow (`test/plan-flow.mjs`), so they cannot silently diverge.
 - `node test/mcp.live.mjs` — lower-level live check of the lib layer directly (refresh → search → basket write → merge/persist verification → cleanup), bypassing the MCP protocol. Needs real credentials and writes a temporary basket to your account.
-- `node mcp/test/tools.live.mjs` — drives every tool through a real stdio MCP client against a live account. Cart tests use a temporary basket and clean up; favorites tests are self-reversing; `set_wolt_token` round-trips the tokens already on disk rather than writing a dummy. A coverage guard compares the tools actually called against `listTools()` and fails the run on any gap, so a newly added tool can't go untested. Only `login_via_chrome` is skipped, being interactive.
+- `node mcp/test/tools.live.mjs` — drives every tool through a real stdio MCP client against a live account. Cart tests use a temporary basket and clean up; favorites tests are self-reversing; `set_wolt_token` round-trips the tokens already on disk rather than writing a dummy. A coverage guard compares the tools actually called against `listTools()` and fails the run on any gap, so a newly added tool can't go untested. Both browser login tools are skipped because they require user interaction.
 
 - `node mcp/test/boot.test.mjs` (part of `npm test`) — starts the real server over stdio and lists its tools, catching broken tool registration without a live Wolt account.
 - `npm run bench` (`node test/bench.mjs`) — scores match quality against the same recorded catalogs and prints the delta against `test/benchmarks/baseline.json` (`--save` adopts a new baseline). It deliberately does not report coverage, which lies: a run can fill every line while putting tomato pesto where tomatoes belong. It counts **correct** lines and **traps** — lines filled with the wrong thing, which is worse than a missing line because the user is told it's handled. Ground truth is per-market accept/reject name patterns, and each market scores against a pinned store so a matching change is measured on a fixed catalog rather than on whichever shop won that minute's race.
